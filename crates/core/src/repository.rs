@@ -101,6 +101,16 @@ pub struct RepositoryOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub no_cache: bool,
 
+    /// Run operations even if restic holds a lock on the repository. rustic does not lock, but
+    /// refuses operations that restic runs exclusively (prune, forget, key remove, repair,
+    /// config changes) while restic holds a lock. Dangerous if restic is running.
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, global = true, env = "RUSTIC_IGNORE_RESTIC_LOCKS")
+    )]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub ignore_restic_locks: bool,
+
     /// Use this dir as cache dir instead of the standard cache dir
     #[cfg_attr(
         feature = "clap",
@@ -717,6 +727,7 @@ impl<S: Open> Repository<S> {
     /// * If the max pack size tolerance percent is wrong
     /// * If the file could not be serialized to json.
     pub fn apply_config(&mut self, opts: &ConfigOptions) -> RusticResult<bool> {
+        self.guard_exclusive()?;
         commands::config::apply_config(self, opts)
     }
 
@@ -735,12 +746,22 @@ impl<S: Open> Repository<S> {
         &self.status.open_status().dbe
     }
 
+    /// Refuse an operation that restic runs under an exclusive lock while restic holds any
+    /// lock, unless `--ignore-restic-locks` is set.
+    pub(crate) fn guard_exclusive(&self) -> RusticResult<()> {
+        if self.opts.ignore_restic_locks {
+            return Ok(());
+        }
+        self.check_restic_locks(true)
+    }
+
     /// Check for lock files written by restic before an operation that restic would lock.
     ///
     /// rustic does not lock, but restic does, and restic assumes nobody prunes while it holds
     /// a lock. An `exclusive` operation is refused if any lock which is not stale exists; a
-    /// non-exclusive operation is refused if an exclusive lock which is not stale exists. A lock
-    /// file that cannot be read also refuses, as in restic.
+    /// non-exclusive operation is refused if an exclusive lock exists. As in restic, stale
+    /// locks also refuse until they are removed, empty lock files are ignored, and a lock file
+    /// that cannot be read refuses.
     ///
     /// # Errors
     ///
@@ -748,7 +769,11 @@ impl<S: Open> Repository<S> {
     pub fn check_restic_locks(&self, exclusive: bool) -> RusticResult<()> {
         let be = self.dbe();
         let now = jiff::Timestamp::now();
-        for id in be.list(FileType::Lock)? {
+        for (id, size) in be.list_with_size(FileType::Lock)? {
+            // like restic, skip empty files left by an interrupted upload
+            if size == 0 {
+                continue;
+            }
             let data = be.read_encrypted_full(FileType::Lock, &id)?;
             let lock: LockFile = serde_json::from_slice(&data).map_err(|err| {
                 RusticError::with_source(
@@ -758,19 +783,26 @@ impl<S: Open> Repository<S> {
                 )
                 .attach_context("id", id.to_string())
             })?;
-            if lock.is_stale(now) || !(exclusive || lock.exclusive) {
+            // like restic, a stale lock still blocks until it is removed by `restic unlock`
+            if !(exclusive || lock.exclusive) {
                 continue;
             }
+            let stale = if lock.is_stale(now) {
+                " It looks stale (older than 30 minutes); if no restic process is running, remove it with `restic unlock`."
+            } else {
+                ""
+            };
             return Err(RusticError::new(
                 ErrorKind::Repository,
-                "The repository is locked by restic ({kind} lock {id}, created at {time} by {user}@{host}, PID {pid}). Wait for restic to finish, remove a stale lock with `restic unlock`, or use --ignore-restic-locks if you know what you are doing.",
+                "The repository is locked by restic ({kind} lock {id}, created at {time} by {user}@{host}, PID {pid}). Wait for restic to finish, or use --ignore-restic-locks if you know what you are doing.{stale}",
             )
             .attach_context("kind", if lock.exclusive { "exclusive" } else { "non-exclusive" })
             .attach_context("id", id.to_string())
             .attach_context("time", lock.time)
             .attach_context("user", lock.username)
             .attach_context("host", lock.hostname)
-            .attach_context("pid", lock.pid.to_string()));
+            .attach_context("pid", lock.pid.to_string())
+            .attach_context("stale", stale));
         }
         Ok(())
     }
@@ -809,6 +841,7 @@ impl<S: Open> Repository<S> {
     ///
     /// * If the key could not be removed.
     pub fn delete_key(&self, id: &KeyId) -> RusticResult<()> {
+        self.guard_exclusive()?;
         if self.key_id().as_ref() == Some(id) {
             return Err(RusticError::new(
                 ErrorKind::Repository,
@@ -1027,6 +1060,7 @@ impl<S: Open> Repository<S> {
     ///
     /// * If the files could not be deleted.
     pub fn delete_snapshots(&self, ids: &[SnapshotId]) -> RusticResult<()> {
+        self.guard_exclusive()?;
         if self.config().append_only == Some(true) {
             return Err(RusticError::new(
                 ErrorKind::Repository,
@@ -1339,6 +1373,9 @@ impl<S: Open> Repository<S> {
     ///
     // TODO: Document errors
     pub fn repair_index(&self, opts: &RepairIndexOptions, dry_run: bool) -> RusticResult<()> {
+        if !dry_run {
+            self.guard_exclusive()?;
+        }
         repair_index(self, *opts, dry_run)
     }
 
@@ -1922,6 +1959,9 @@ impl<S: IndexedFull> Repository<S> {
         snapshots: Vec<SnapshotFile>,
         dry_run: bool,
     ) -> RusticResult<()> {
+        if !dry_run {
+            self.guard_exclusive()?;
+        }
         repair_snapshots(self, opts, snapshots, dry_run)
     }
 
