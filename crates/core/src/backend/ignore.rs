@@ -135,32 +135,62 @@ impl ExcludeTag {
     const CACHEDIR_HEADER: &'static str = "Signature: 8a477f597d28d172789f06886806bc55";
 
     /// Parse `FILE[:HEADER]`, as restic does: split at the first `:`.
-    fn parse(s: &str) -> Self {
-        match s.split_once(':') {
-            Some((file, header)) if !header.is_empty() => Self {
-                filename: OsString::from(file),
-                header: Some(header.as_bytes().to_vec()),
-            },
-            Some((file, _)) => Self {
-                filename: OsString::from(file),
-                header: None,
-            },
-            None => Self {
-                filename: OsString::from(s),
-                header: None,
-            },
+    ///
+    /// # Errors
+    ///
+    /// * If the file name is empty, absolute, or contains `.` or `..` components
+    ///   (restic rejects an empty name too; an absolute name would match every directory).
+    fn parse(s: &str) -> RusticResult<Self> {
+        let (file, header) = match s.split_once(':') {
+            Some((file, header)) => (
+                file,
+                (!header.is_empty()).then(|| header.as_bytes().to_vec()),
+            ),
+            None => (s, None),
+        };
+        let valid = !file.is_empty()
+            && Path::new(file)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !valid {
+            return Err(RusticError::new(
+                ErrorKind::InvalidInput,
+                "Invalid name `{name}` for an exclusion tag file: it must be a relative file name.",
+            )
+            .attach_context("name", s.to_string()));
         }
+        Ok(Self {
+            filename: OsString::from(file),
+            header,
+        })
     }
 
     fn cachedir() -> Self {
-        Self::parse(&format!("CACHEDIR.TAG:{}", Self::CACHEDIR_HEADER))
+        Self {
+            filename: OsString::from("CACHEDIR.TAG"),
+            header: Some(Self::CACHEDIR_HEADER.as_bytes().to_vec()),
+        }
     }
 
     /// Returns true if `dir` contains this tag file (with matching header, if one is given).
+    ///
+    /// Like restic, the tag file itself is checked with `lstat` (a dangling symlink counts as
+    /// present), and any error other than "not found" is reported and does not exclude.
     fn is_present_in(&self, dir: &Path) -> bool {
         let path = dir.join(&self.filename);
+        match path.symlink_metadata() {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(err) => {
+                warn!(
+                    "could not access tag file {}, not excluding: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        }
         let Some(header) = &self.header else {
-            return path.exists();
+            return true;
         };
         let mut buf = vec![0; header.len()];
         match File::open(&path).and_then(|mut f| f.read_exact(&mut buf)) {
@@ -172,7 +202,6 @@ impl ExcludeTag {
                 );
                 false
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
                 warn!(
                     "could not read header of tag file {}, not excluding: {err}",
@@ -183,7 +212,6 @@ impl ExcludeTag {
         }
     }
 }
-
 impl LocalSource {
     /// Create a local source from [`LocalSourceSaveOptions`], [`LocalSourceFilterOptions`] and backup path(s).
     ///
@@ -236,7 +264,7 @@ impl LocalSource {
             .exclude_if_present
             .iter()
             .map(|s| ExcludeTag::parse(s))
-            .collect();
+            .collect::<RusticResult<_>>()?;
         if filter_opts.exclude_caches {
             exclude_if_present.push(ExcludeTag::cachedir());
         }
@@ -507,19 +535,29 @@ mod exclude_tag_tests {
     #[test]
     fn parse_file_and_header() {
         assert_eq!(
-            ExcludeTag::parse("a.tag"),
+            ExcludeTag::parse("a.tag").unwrap(),
             ExcludeTag {
                 filename: "a.tag".into(),
                 header: None
             }
         );
         assert_eq!(
-            ExcludeTag::parse("a.tag:Sig: x"),
+            ExcludeTag::parse("a.tag:Sig: x").unwrap(),
             ExcludeTag {
                 filename: "a.tag".into(),
                 header: Some(b"Sig: x".to_vec())
             }
         );
+    }
+
+    #[test]
+    fn reject_empty_or_absolute_tag_names() {
+        for bad in ["", ":Sig", "/etc/passwd", "..", "./x"] {
+            assert!(ExcludeTag::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        // like restic, split at the first ':' - this is file "C" with header "\x"
+        assert!(ExcludeTag::parse(r"C:\x").is_ok());
+        assert!(ExcludeTag::parse("sub/tag").is_ok());
     }
 
     #[test]
