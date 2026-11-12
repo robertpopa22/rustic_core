@@ -12,6 +12,7 @@ use serde_with::{DeserializeAs, SerializeAs};
 pub(crate) mod configfile;
 pub(crate) mod indexfile;
 pub(crate) mod keyfile;
+pub mod lockfile;
 pub(crate) mod packfile;
 pub(crate) mod snapshotfile;
 

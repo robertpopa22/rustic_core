@@ -15,6 +15,8 @@ use std::{
 use bytes::Bytes;
 use derive_setters::Setters;
 use jiff::SignedDuration;
+
+use crate::repofile::lockfile::LockFile;
 use log::info;
 use serde_with::{DisplayFromStr, serde_as};
 
@@ -731,6 +733,46 @@ impl<S: Open> Repository<S> {
     // TODO: add documentation!
     pub(crate) fn dbe(&self) -> &DecryptBackend<Key> {
         &self.status.open_status().dbe
+    }
+
+    /// Check for lock files written by restic before an operation that restic would lock.
+    ///
+    /// rustic does not lock, but restic does, and restic assumes nobody prunes while it holds
+    /// a lock. An `exclusive` operation is refused if any lock which is not stale exists; a
+    /// non-exclusive operation is refused if an exclusive lock which is not stale exists. A lock
+    /// file that cannot be read also refuses, as in restic.
+    ///
+    /// # Errors
+    ///
+    /// * If a blocking restic lock exists, or the lock files cannot be listed or read.
+    pub fn check_restic_locks(&self, exclusive: bool) -> RusticResult<()> {
+        let be = self.dbe();
+        let now = jiff::Timestamp::now();
+        for id in be.list(FileType::Lock)? {
+            let data = be.read_encrypted_full(FileType::Lock, &id)?;
+            let lock: LockFile = serde_json::from_slice(&data).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::Repository,
+                    "Could not read lock file `{id}`. Remove it with `restic unlock` if it is stale, or use --ignore-restic-locks.",
+                    err,
+                )
+                .attach_context("id", id.to_string())
+            })?;
+            if lock.is_stale(now) || !(exclusive || lock.exclusive) {
+                continue;
+            }
+            return Err(RusticError::new(
+                ErrorKind::Repository,
+                "The repository is locked by restic ({kind} lock {id}, created at {time} by {user}@{host}, PID {pid}). Wait for restic to finish, remove a stale lock with `restic unlock`, or use --ignore-restic-locks if you know what you are doing.",
+            )
+            .attach_context("kind", if lock.exclusive { "exclusive" } else { "non-exclusive" })
+            .attach_context("id", id.to_string())
+            .attach_context("time", lock.time)
+            .attach_context("user", lock.username)
+            .attach_context("host", lock.hostname)
+            .attach_context("pid", lock.pid.to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) fn cache(&self) -> Option<&Cache> {

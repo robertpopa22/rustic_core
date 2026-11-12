@@ -63,6 +63,9 @@ pub enum FileType {
     /// Data
     #[serde(rename = "pack")]
     Pack,
+    /// Lock files, as written by restic (rustic itself does not lock)
+    #[serde(rename = "lock")]
+    Lock,
 }
 
 impl FileType {
@@ -75,13 +78,14 @@ impl FileType {
             Self::Index => "index",
             Self::Key => "keys",
             Self::Pack => "data",
+            Self::Lock => "locks",
         }
     }
 
     /// Returns if the file type is cacheable.
     const fn is_cacheable(self) -> bool {
         match self {
-            Self::Config | Self::Key | Self::Pack => false,
+            Self::Config | Self::Key | Self::Pack | Self::Lock => false,
             Self::Snapshot | Self::Index => true,
         }
     }
