@@ -258,17 +258,40 @@ impl LocalSource {
         let needs_entry_filter = !exclude_if_present.is_empty() || !exclude_if_xattr.is_empty();
 
         if needs_entry_filter {
+            // Which tags are present in a directory, checked once per directory (like restic's
+            // rejection cache), so a directory with many entries costs one lookup per tag.
+            let tags_in_dir: std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<bool>>> =
+                std::sync::Mutex::default();
             _ = walk_builder.filter_entry(move |entry| {
                 // exclude-if-present: skip the contents of directories containing a tag file,
                 // but keep the directory itself and the tag file (same as restic)
                 if !exclude_if_present.is_empty()
                     && entry.depth() > 0
                     && let Some(parent) = entry.path().parent()
-                    && exclude_if_present.iter().any(|tag| {
-                        entry.file_name() != tag.filename.as_os_str() && tag.is_present_in(parent)
-                    })
                 {
-                    return false;
+                    let present = {
+                        let mut cache = tags_in_dir
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        cache
+                            .entry(parent.to_path_buf())
+                            .or_insert_with(|| {
+                                exclude_if_present
+                                    .iter()
+                                    .map(|tag| tag.is_present_in(parent))
+                                    .collect()
+                            })
+                            .clone()
+                    };
+                    if exclude_if_present
+                        .iter()
+                        .zip(present)
+                        .any(|(tag, present)| {
+                            present && entry.file_name() != tag.filename.as_os_str()
+                        })
+                    {
+                        return false;
+                    }
                 }
 
                 // exclude-if-xattr: skip entries that have a matching xattr
@@ -535,5 +558,22 @@ mod exclude_tag_tests {
         assert!(got.contains(&"marked/.nobackup".to_string()));
         assert!(!got.contains(&"marked/data".to_string()));
         assert!(got.contains(&"cache/data".to_string()));
+    }
+
+    #[test]
+    fn two_tags_in_one_dir_exclude_each_other_like_restic() {
+        // restic 0.19.1 drops both tag files when two different tags sit in the same
+        // directory: each one is "another tag's directory content".
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("two");
+        std::fs::create_dir(&d).unwrap();
+        for f in ["T1", "T2", "data"] {
+            std::fs::write(d.join(f), b"").unwrap();
+        }
+        let opts = LocalSourceFilterOptions {
+            exclude_if_present: vec!["T1".into(), "T2".into()],
+            ..Default::default()
+        };
+        assert_eq!(names(&source(dir.path(), &opts)), ["two"]);
     }
 }
