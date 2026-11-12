@@ -283,8 +283,9 @@ impl ReadBackend for LocalBackend {
             return Ok(Vec::new());
         }
 
-        // e.g. `locks/` does not exist in a repository created by rustic
-        if !path.exists() {
+        // `locks/` does not exist in a repository created by rustic; this is the only
+        // directory where "missing" means "empty" without a warning
+        if tpe == FileType::Lock && !path.exists() {
             return Ok(Vec::new());
         }
 
