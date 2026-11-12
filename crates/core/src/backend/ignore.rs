@@ -4,6 +4,7 @@ pub use mapper::LocalSourceSaveOptions;
 use std::{
     ffi::OsString,
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -67,6 +68,7 @@ pub struct LocalSource {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 #[setters(into)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)]
 /// [`LocalSourceFilterOptions`] allow to filter a local source by various criteria.
 pub struct LocalSourceFilterOptions {
     /// Ignore files based on .gitignore files
@@ -87,10 +89,20 @@ pub struct LocalSourceFilterOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::vec::overwrite_empty))]
     pub custom_ignorefiles: Vec<String>,
 
-    /// Exclude contents of directories containing this filename (can be specified multiple times)
-    #[cfg_attr(feature = "clap", clap(long, value_name = "FILE"))]
+    /// Exclude contents of directories containing this filename (can be specified multiple times).
+    ///
+    /// Use `FILE:HEADER` to only exclude if the file starts with the given header.
+    /// As in restic, the directory itself and the tag file are kept.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "FILE[:HEADER]"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::vec::overwrite_empty))]
     pub exclude_if_present: Vec<String>,
+
+    /// Exclude contents of cache directories marked by a valid `CACHEDIR.TAG` file
+    /// (see <https://bford.info/cachedir/>). Same as
+    /// `--exclude-if-present "CACHEDIR.TAG:Signature: 8a477f597d28d172789f06886806bc55"`.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub exclude_caches: bool,
 
     /// Exclude files/directories having the given extended attribute set (can be specified multiple times)
     #[cfg_attr(feature = "clap", clap(long, value_name = "XATTR"))]
@@ -107,6 +119,69 @@ pub struct LocalSourceFilterOptions {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub exclude_larger_than: Option<ByteSize>,
+}
+
+/// A tag file given by `--exclude-if-present` or `--exclude-caches`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExcludeTag {
+    /// Name of the tag file
+    filename: OsString,
+    /// Header the tag file must start with (if any)
+    header: Option<Vec<u8>>,
+}
+
+impl ExcludeTag {
+    /// Signature of a valid `CACHEDIR.TAG`, see <https://bford.info/cachedir/>
+    const CACHEDIR_HEADER: &'static str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+    /// Parse `FILE[:HEADER]`, as restic does: split at the first `:`.
+    fn parse(s: &str) -> Self {
+        match s.split_once(':') {
+            Some((file, header)) if !header.is_empty() => Self {
+                filename: OsString::from(file),
+                header: Some(header.as_bytes().to_vec()),
+            },
+            Some((file, _)) => Self {
+                filename: OsString::from(file),
+                header: None,
+            },
+            None => Self {
+                filename: OsString::from(s),
+                header: None,
+            },
+        }
+    }
+
+    fn cachedir() -> Self {
+        Self::parse(&format!("CACHEDIR.TAG:{}", Self::CACHEDIR_HEADER))
+    }
+
+    /// Returns true if `dir` contains this tag file (with matching header, if one is given).
+    fn is_present_in(&self, dir: &Path) -> bool {
+        let path = dir.join(&self.filename);
+        let Some(header) = &self.header else {
+            return path.exists();
+        };
+        let mut buf = vec![0; header.len()];
+        match File::open(&path).and_then(|mut f| f.read_exact(&mut buf)) {
+            Ok(()) if &buf == header => true,
+            Ok(()) => {
+                warn!(
+                    "tag file {} does not start with the expected header, not excluding",
+                    path.display()
+                );
+                false
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                warn!(
+                    "could not read header of tag file {}, not excluding: {err}",
+                    path.display()
+                );
+                false
+            }
+        }
+    }
 }
 
 impl LocalSource {
@@ -157,7 +232,14 @@ impl LocalSource {
             .max_filesize(filter_opts.exclude_larger_than.map(|s| s.as_u64()))
             .overrides(overrides);
 
-        let exclude_if_present = filter_opts.exclude_if_present.clone();
+        let mut exclude_if_present: Vec<ExcludeTag> = filter_opts
+            .exclude_if_present
+            .iter()
+            .map(|s| ExcludeTag::parse(s))
+            .collect();
+        if filter_opts.exclude_caches {
+            exclude_if_present.push(ExcludeTag::cachedir());
+        }
         let exclude_if_xattr: Vec<OsString> = filter_opts
             .exclude_if_xattr
             .iter()
@@ -177,13 +259,14 @@ impl LocalSource {
 
         if needs_entry_filter {
             _ = walk_builder.filter_entry(move |entry| {
-                // exclude-if-present: skip directories containing a marker file
+                // exclude-if-present: skip the contents of directories containing a tag file,
+                // but keep the directory itself and the tag file (same as restic)
                 if !exclude_if_present.is_empty()
-                    && let Some(tpe) = entry.file_type()
-                    && tpe.is_dir()
-                    && exclude_if_present
-                        .iter()
-                        .any(|file| entry.path().join(file).exists())
+                    && entry.depth() > 0
+                    && let Some(parent) = entry.path().parent()
+                    && exclude_if_present.iter().any(|tag| {
+                        entry.file_name() != tag.filename.as_os_str() && tag.is_present_in(parent)
+                    })
                 {
                     return false;
                 }
@@ -345,5 +428,112 @@ impl Iterator for LocalSourceWalker {
                 .attach_context("path", path)
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod exclude_tag_tests {
+    use super::*;
+
+    fn names(src: &LocalSource) -> Vec<String> {
+        let root = src.builder.build().next().unwrap().unwrap().into_path();
+        let mut v: Vec<String> = src
+            .builder
+            .build()
+            .filter_map(Result::ok)
+            .filter(|e| e.depth() > 0)
+            .map(|e| {
+                e.path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for d in ["cache", "badcache", "marked", "plain"] {
+            std::fs::create_dir(p.join(d)).unwrap();
+            std::fs::write(p.join(d).join("data"), b"x").unwrap();
+        }
+        std::fs::write(
+            p.join("cache/CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# comment",
+        )
+        .unwrap();
+        std::fs::write(p.join("badcache/CACHEDIR.TAG"), b"nope").unwrap();
+        std::fs::write(p.join("marked/.nobackup"), b"").unwrap();
+        dir
+    }
+
+    fn source(dir: &Path, opts: &LocalSourceFilterOptions) -> LocalSource {
+        LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            opts,
+            &[dir],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_file_and_header() {
+        assert_eq!(
+            ExcludeTag::parse("a.tag"),
+            ExcludeTag {
+                filename: "a.tag".into(),
+                header: None
+            }
+        );
+        assert_eq!(
+            ExcludeTag::parse("a.tag:Sig: x"),
+            ExcludeTag {
+                filename: "a.tag".into(),
+                header: Some(b"Sig: x".to_vec())
+            }
+        );
+    }
+
+    #[test]
+    fn exclude_caches_keeps_dir_and_tag_like_restic() {
+        let dir = tree();
+        let opts = LocalSourceFilterOptions {
+            exclude_caches: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            names(&source(dir.path(), &opts)),
+            [
+                "badcache",
+                "badcache/CACHEDIR.TAG",
+                "badcache/data",
+                "cache",
+                "cache/CACHEDIR.TAG",
+                "marked",
+                "marked/.nobackup",
+                "marked/data",
+                "plain",
+                "plain/data",
+            ]
+        );
+    }
+
+    #[test]
+    fn exclude_if_present_keeps_dir_and_tag_like_restic() {
+        let dir = tree();
+        let opts = LocalSourceFilterOptions {
+            exclude_if_present: vec![".nobackup".into()],
+            ..Default::default()
+        };
+        let got = names(&source(dir.path(), &opts));
+        assert!(got.contains(&"marked".to_string()));
+        assert!(got.contains(&"marked/.nobackup".to_string()));
+        assert!(!got.contains(&"marked/data".to_string()));
+        assert!(got.contains(&"cache/data".to_string()));
     }
 }
