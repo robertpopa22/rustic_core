@@ -55,6 +55,10 @@ pub(super) mod constants {
 #[non_exhaustive]
 /// Options for the `prune` command
 pub struct PruneOptions {
+    /// Prune even if restic holds a lock on the repository (dangerous if restic is running)
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub ignore_restic_locks: bool,
+
     /// Define maximum data to repack in % of reposize or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
     #[cfg_attr(
         feature = "clap",
@@ -136,6 +140,7 @@ pub struct PruneOptions {
 impl Default for PruneOptions {
     fn default() -> Self {
         Self {
+            ignore_restic_locks: false,
             max_repack: LimitOption::Percentage(10),
             max_unused: LimitOption::Percentage(5),
             keep_pack: Span::new(),
@@ -1089,6 +1094,9 @@ pub(crate) fn prune_repository<S: Open>(
             ErrorKind::AppendOnly,
             "Pruning is not allowed in append-only repositories. Please disable append-only mode first, if you know what you are doing. Aborting.",
         ));
+    }
+    if !opts.ignore_restic_locks {
+        repo.check_restic_locks(true)?;
     }
     repo.warm_up_wait(prune_plan.repack_packs().into_iter())?;
     let be = repo.dbe();

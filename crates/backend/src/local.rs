@@ -283,6 +283,11 @@ impl ReadBackend for LocalBackend {
             return Ok(Vec::new());
         }
 
+        // e.g. `locks/` does not exist in a repository created by rustic
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
         let walker = WalkDir::new(path).into_iter().filter_map(|r| {
             let entry = r
                 .inspect_err(|err| error!("error listing {tpe}: {err}"))
