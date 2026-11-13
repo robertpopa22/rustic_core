@@ -285,8 +285,43 @@ impl ReadBackend for LocalBackend {
 
         // `locks/` does not exist in a repository created by rustic; this is the only
         // directory where "missing" means "empty" without a warning
-        if tpe == FileType::Lock && !path.exists() {
-            return Ok(Vec::new());
+        // lock files must be listed strictly: a lock which cannot be seen cannot protect.
+        // Only a missing locks/ (never created by rustic) means "no locks".
+        if tpe == FileType::Lock {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) => {
+                    return Err(RusticError::with_source(
+                        ErrorKind::Backend,
+                        "Failed to list lock files in {path}.",
+                        err,
+                    )
+                    .attach_context("path", path.display().to_string()));
+                }
+            };
+            let mut locks = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|err| {
+                    RusticError::with_source(ErrorKind::Backend, "Failed to list lock files.", err)
+                })?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(id) = Id::parse_some(&name, tpe) else {
+                    continue;
+                };
+                let meta = entry.metadata().map_err(|err| {
+                    RusticError::with_source(
+                        ErrorKind::Backend,
+                        "Failed to read metadata of lock file {name}.",
+                        err,
+                    )
+                    .attach_context("name", name.clone())
+                })?;
+                if meta.is_file() {
+                    locks.push((id, u32::try_from(meta.len()).unwrap_or(u32::MAX)));
+                }
+            }
+            return Ok(locks);
         }
 
         let walker = WalkDir::new(path).into_iter().filter_map(|r| {

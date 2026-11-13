@@ -772,6 +772,19 @@ impl<S: Open> Repository<S> {
     /// holds any lock, unless `--ignore-restic-locks` is set. With `--restic-locks`, take an
     /// exclusive lock for the rest of this repository's lifetime.
     pub(crate) fn guard_exclusive(&self) -> RusticResult<()> {
+        self.lock_exclusive()
+    }
+
+    /// Lock the repository exclusively for the rest of its lifetime, like restic does for
+    /// prune, forget, check, key remove, repair, rewrite with forget and config changes. Call it
+    /// before reading what the operation works on. With `--restic-locks` an exclusive lock
+    /// file is written; otherwise the operation is refused while another process holds any
+    /// lock. Does nothing with `--ignore-restic-locks`.
+    ///
+    /// # Errors
+    ///
+    /// * If another process holds a lock, or the lock cannot be written.
+    pub fn lock_exclusive(&self) -> RusticResult<()> {
         if self.opts.ignore_restic_locks {
             return Ok(());
         }
@@ -802,13 +815,14 @@ impl<S: Open> Repository<S> {
         check_locks(self.dbe(), exclusive, &own)
     }
 
-    /// Remove lock files like `restic unlock`: stale and unreadable ones, or all of them if
-    /// `all` is set. Locks held by this repository are kept. Returns the number removed.
+    /// Remove lock files like `restic unlock`: stale ones, or all of them (also unreadable
+    /// ones) if `all` is set. Locks held by this repository are kept. With `dry_run`, nothing
+    /// is removed. Returns the ids of the lock files removed (or which would be removed).
     ///
     /// # Errors
     ///
     /// * If the lock files cannot be listed or removed.
-    pub fn unlock(&self, all: bool) -> RusticResult<usize> {
+    pub fn unlock(&self, all: bool, dry_run: bool) -> RusticResult<Vec<crate::Id>> {
         let own = self
             .status
             .open_status()
@@ -816,7 +830,7 @@ impl<S: Open> Repository<S> {
             .as_ref()
             .map(ResticLocks::ids)
             .unwrap_or_default();
-        remove_locks(self.dbe(), all, &own)
+        remove_locks(self.dbe(), all, dry_run, &own)
     }
     pub(crate) fn cache(&self) -> Option<&Cache> {
         self.status.open_status().cache.as_ref()
