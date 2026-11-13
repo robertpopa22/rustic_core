@@ -6,7 +6,7 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Mutex};
 
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
@@ -63,6 +63,41 @@ pub struct RestoreOptions {
     /// Restore sparse files
     #[cfg_attr(feature = "clap", clap(long))]
     pub sparse: Option<SparseRestore>,
+
+    /// What to do with files which already exist in the destination, like restic`s
+    /// `--overwrite`. Default: `if-changed` (`always` with `--verify-existing`).
+    #[cfg_attr(feature = "clap", clap(long, value_name = "MODE"))]
+    pub overwrite: Option<OverwriteMode>,
+
+    /// Verify the content of the restored files after the restore, like restic`s `--verify`
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub verify: bool,
+}
+
+/// What to do with files which already exist in the destination (restic `--overwrite`)
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum OverwriteMode {
+    /// Read existing files and restore only what differs; metadata is always restored
+    Always,
+    /// Like `always`, but trust files with the right size and modification time
+    IfChanged,
+    /// Only overwrite files whose modification time is older than in the snapshot
+    IfNewer,
+    /// Never touch existing files (neither content nor metadata)
+    Never,
+}
+
+impl RestoreOptions {
+    /// The effective overwrite mode.
+    #[must_use]
+    pub fn overwrite_mode(&self) -> OverwriteMode {
+        self.overwrite.unwrap_or(if self.verify_existing {
+            OverwriteMode::Always
+        } else {
+            OverwriteMode::IfChanged
+        })
+    }
 }
 
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +122,8 @@ pub struct FileDirStats {
     pub modify: u64,
     /// Number of additional entries
     pub additional: u64,
+    /// Number of existing entries left untouched because of `--overwrite if-newer|never`
+    pub skipped: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -142,7 +179,13 @@ pub(crate) fn restore_repository<S: IndexedTree>(
     )?;
 
     let p = repo.progress_spinner("setting metadata...");
-    restore_metadata(node_streamer, &file_infos.hardlink_candidates, opts, dest)?;
+    restore_metadata(
+        node_streamer,
+        &file_infos.hardlink_candidates,
+        &file_infos.skipped,
+        opts,
+        dest,
+    )?;
     p.finish();
 
     Ok(())
@@ -278,10 +321,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         std::collections::btree_map::Entry::Occupied(_) => return Ok(()), // this is a hardlink to an existing candidate, will be processed later while setting metadata
                     }
                 }
+                if exists && keep_existing(dest, path, node, opts.overwrite_mode()) {
+                    stats.files.skipped += 1;
+                    debug!("keeping existing file: {}", path.display());
+                    _ = restore_infos.skipped.insert(path.clone());
+                    return Ok(());
+                }
                 // collect blobs needed for restoring
+                let verify_existing = opts.overwrite_mode() == OverwriteMode::Always;
                 match (
                     exists,
-                    restore_infos.add_file(dest, node, path.clone(), repo, opts.verify_existing)?,
+                    restore_infos.add_file(dest, node, path.clone(), repo, verify_existing)?,
                 ) {
                     // Note that exists = false and Existing or Verified can happen if the file is changed between scanning the dir
                     // and calling add_file. So we don't care about exists but trust add_file here.
@@ -390,11 +440,15 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
+    skipped: &BTreeSet<PathBuf>,
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<()> {
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
+        if skipped.contains(&path) {
+            continue;
+        }
         // Create hardlink directly, if this is one.
         if let Some(key) = hardlink_key(&node)
             && let Some(canonical) = hardlink_candidates.get(&key)
@@ -439,6 +493,89 @@ fn restore_metadata(
     }
 
     Ok(())
+}
+
+/// Whether an existing file is kept as it is (`--overwrite never|if-newer`), like restic:
+/// `never` keeps every existing file; `if-newer` keeps it unless the snapshot has a newer
+/// modification time.
+fn keep_existing(dest: &LocalDestination, path: &Path, node: &Node, mode: OverwriteMode) -> bool {
+    match mode {
+        OverwriteMode::Always | OverwriteMode::IfChanged => false,
+        OverwriteMode::Never => true,
+        OverwriteMode::IfNewer => {
+            let existing = dest
+                .path(path)
+                .ok()
+                .and_then(|p| std::fs::symlink_metadata(p).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| Timestamp::try_from(t).ok());
+            match (existing, node.meta.mtime) {
+                (Some(existing), Some(snap)) => snap <= existing,
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Verify restored files against the snapshot, like restic `restore --verify`: every file
+/// (except those in `skipped`) must have the snapshot's size and content. Returns the number
+/// of files verified.
+///
+/// # Errors
+///
+/// * If a file is missing, has the wrong size or content, or cannot be read.
+pub(crate) fn verify_restore<S: IndexedFull>(
+    repo: &Repository<S>,
+    mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
+    dest: &LocalDestination,
+    skipped: &BTreeSet<PathBuf>,
+) -> RusticResult<u64> {
+    let p = repo.progress_counter("verifying restored files...");
+    let mut verified = 0;
+    let mut errors = Vec::new();
+    while let Some((path, node)) = node_streamer.next().transpose()? {
+        if !node.is_file() || skipped.contains(&path) {
+            continue;
+        }
+        let full = dest.path(&path).map_err(|err| {
+            RusticError::with_source(ErrorKind::InputOutput, "Invalid path `{path}`.", err)
+                .attach_context("path", path.display().to_string())
+        })?;
+        let ok = match std::fs::File::open(&full) {
+            Err(err) => {
+                errors.push(format!("{}: {err}", path.display()));
+                continue;
+            }
+            Ok(mut file) => {
+                let size_ok = file.metadata().is_ok_and(|m| m.len() == node.meta.size);
+                size_ok
+                    && node.content.iter().flatten().all(|id| {
+                        repo.get_index_entry(id).is_ok_and(|ie| {
+                            id.blob_matches_reader(ie.location.data_length().into(), &mut file)
+                        })
+                    })
+            }
+        };
+        if ok {
+            verified += 1;
+            p.inc(1);
+        } else {
+            errors.push(format!("{}: content differs from the snapshot", path.display()));
+        }
+    }
+    p.finish();
+    if errors.is_empty() {
+        Ok(verified)
+    } else {
+        for e in &errors {
+            error!("verification failed: {e}");
+        }
+        Err(RusticError::new(
+            ErrorKind::Verification,
+            "Verification of {count} restored files failed.",
+        )
+        .attach_context("count", errors.len().to_string()))
+    }
 }
 
 fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
@@ -713,6 +850,8 @@ pub struct RestorePlan {
     pub matched_size: u64,
     /// Statistics about the restore.
     pub stats: RestoreStats,
+    /// Existing files left untouched (`--overwrite if-newer|never`): no content, no metadata
+    pub skipped: BTreeSet<PathBuf>,
 }
 
 /// [`FileLocation`] contains information about a file within a blob

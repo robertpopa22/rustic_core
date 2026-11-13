@@ -52,7 +52,7 @@ use crate::{
             snapshots::{RepairSnapshotsOptions, repair_snapshots},
         },
         repoinfo::{IndexInfos, RepoFileInfos},
-        restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
+        restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository, verify_restore},
         rewrite::{RewriteOptions, rewrite_snapshots, rewrite_snapshots_and_trees},
     },
     crypto::aespoly1305::Key,
@@ -2034,5 +2034,22 @@ impl<S: IndexedFull> Repository<S> {
         tree_opts: &RewriteTreesOptions,
     ) -> RusticResult<Vec<SnapshotFile>> {
         rewrite_snapshots_and_trees(self, snapshots, opts, tree_opts)
+    }
+}
+
+impl<S: IndexedFull> Repository<S> {
+    /// Verify restored files against the snapshot, like restic `restore --verify`. Pass a fresh
+    /// node streamer over the same nodes that were restored, and the plan's skipped files.
+    ///
+    /// # Errors
+    ///
+    /// * If a restored file is missing or differs from the snapshot.
+    pub fn verify_restore(
+        &self,
+        node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
+        dest: &LocalDestination,
+        skipped: &std::collections::BTreeSet<PathBuf>,
+    ) -> RusticResult<u64> {
+        verify_restore(self, node_streamer, dest, skipped)
     }
 }
