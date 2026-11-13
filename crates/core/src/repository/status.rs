@@ -66,6 +66,8 @@ pub struct OpenStatus {
     pub(super) config: ConfigFile,
     /// The [`KeyId`] of the used key
     pub(super) key_id: Option<KeyId>,
+    /// restic-compatible locks held while the repository is open (`--restic-locks`)
+    pub(super) restic_locks: Option<crate::repofile::lockfile::ResticLocks>,
 }
 
 impl Open for OpenStatus {
