@@ -3,7 +3,7 @@ use std::path::Path;
 use bytes::Bytes;
 
 use crate::{
-    backend::{FileType, FindInBackend, decrypt::DecryptReadBackend},
+    backend::{FileType, FindInBackend, ReadBackend, decrypt::DecryptReadBackend},
     blob::{BlobId, BlobType, tree::Tree},
     error::{ErrorKind, RusticError, RusticResult},
     index::ReadIndex,
@@ -43,6 +43,38 @@ pub(crate) fn cat_file<S: Open>(
     Ok(data)
 }
 
+/// Returns the contents of a file as stored, without decryption: a key file (stored as plain
+/// JSON) or a pack file (raw bytes), like `restic cat key` and `restic cat pack`.
+///
+/// # Errors
+///
+/// * If the id is invalid, not found or not unique, or the file cannot be read.
+pub(crate) fn cat_file_raw<S: Open>(
+    repo: &Repository<S>,
+    tpe: FileType,
+    id: &str,
+) -> RusticResult<Bytes> {
+    let id = repo.dbe().find_id(tpe, id)?;
+    repo.dbe().read_full(tpe, &id)
+}
+
+/// Returns the decrypted contents of a blob of either type, like `restic cat blob`: data
+/// blobs are looked up first, then tree blobs.
+///
+/// # Errors
+///
+/// * If the id is invalid or no blob with this id is in the index.
+pub(crate) fn cat_blob_any<S: IndexedFull>(repo: &Repository<S>, id: &str) -> RusticResult<Bytes> {
+    let id: BlobId = id.parse()?;
+    let tpe = [BlobType::Data, BlobType::Tree]
+        .into_iter()
+        .find(|tpe| repo.index().has(*tpe, &id))
+        .ok_or_else(|| {
+            RusticError::new(ErrorKind::InvalidInput, "Blob `{id}` is not in the index.")
+                .attach_context("id", id.to_string())
+        })?;
+    repo.index().blob_from_backend(repo.dbe(), tpe, &id)
+}
 // TODO: Add documentation!
 ///
 /// # Type Parameters
