@@ -50,6 +50,10 @@ impl ReadBackend for HotColdBackend {
     }
 
     fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+        // lock files live only in the (cold) repository restic sees, like their listing
+        if tpe == FileType::Lock {
+            return self.be.read_full(tpe, id);
+        }
         self.be_hot.read_full(tpe, id)
     }
 
@@ -94,7 +98,7 @@ impl WriteBackend for HotColdBackend {
         cacheable: bool,
         content: BytesList,
     ) -> RusticResult<()> {
-        if tpe != FileType::Config && (cacheable || tpe != FileType::Pack) {
+        if tpe != FileType::Config && tpe != FileType::Lock && (cacheable || tpe != FileType::Pack) {
             self.be_hot
                 .write_bytes(tpe, id, cacheable, content.clone())?;
         }
@@ -104,7 +108,7 @@ impl WriteBackend for HotColdBackend {
     fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
         // First remove cold file
         self.be.remove(tpe, id, cacheable)?;
-        if cacheable || tpe != FileType::Pack {
+        if tpe != FileType::Lock && (cacheable || tpe != FileType::Pack) {
             self.be_hot.remove(tpe, id, cacheable)?;
         }
         Ok(())

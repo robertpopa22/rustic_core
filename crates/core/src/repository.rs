@@ -16,7 +16,7 @@ use bytes::Bytes;
 use derive_setters::Setters;
 use jiff::SignedDuration;
 
-use crate::repofile::lockfile::LockFile;
+use crate::repofile::lockfile::{ResticLocks, check_locks, remove_locks};
 use log::info;
 use serde_with::{DisplayFromStr, serde_as};
 
@@ -95,21 +95,31 @@ mod constants {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 #[setters(into, strip_option)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RepositoryOptions {
     /// Don't use a cache.
     #[cfg_attr(feature = "clap", clap(long, global = true, env = "RUSTIC_NO_CACHE"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub no_cache: bool,
 
-    /// Run operations even if restic holds a lock on the repository. rustic does not lock, but
-    /// refuses operations that restic runs exclusively (prune, forget, key remove, repair,
-    /// config changes) while restic holds a lock. Dangerous if restic is running.
+    /// Neither check nor write restic lock files. By default rustic refuses to open a
+    /// repository while restic holds an exclusive lock, and refuses operations that restic
+    /// runs exclusively (prune, forget, key remove, repair, config changes) while restic holds
+    /// any lock. Dangerous if restic is running.
     #[cfg_attr(
         feature = "clap",
         clap(long, global = true, env = "RUSTIC_IGNORE_RESTIC_LOCKS")
     )]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub ignore_restic_locks: bool,
+
+    /// Write lock files in restic's format while the repository is open, so that restic
+    /// sees rustic: a non-exclusive lock for every operation and an exclusive lock for the
+    /// operations that restic runs exclusively. Locks are refreshed every 5 minutes and
+    /// removed at the end; use `unlock` after a crash.
+    #[cfg_attr(feature = "clap", clap(long, global = true, env = "RUSTIC_RESTIC_LOCKS"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub restic_locks: bool,
 
     /// Use this dir as cache dir instead of the standard cache dir
     #[cfg_attr(
@@ -576,11 +586,23 @@ impl<S> Repository<S> {
         dbe.set_zstd(config.zstd()?);
         dbe.set_extra_verify(config.extra_verify());
 
+        // like restic, open under a non-exclusive lock: refuse while another process holds an
+        // exclusive lock, and with `--restic-locks` also write our own lock
+        let restic_locks = if self.opts.ignore_restic_locks {
+            None
+        } else if self.opts.restic_locks {
+            Some(ResticLocks::acquire(dbe.clone(), false)?)
+        } else {
+            check_locks(&dbe, false, &[])?;
+            None
+        };
+
         let open = OpenStatus {
             cache,
             dbe,
             config,
             key_id,
+            restic_locks,
         };
 
         Ok(Repository {
@@ -746,67 +768,70 @@ impl<S: Open> Repository<S> {
         &self.status.open_status().dbe
     }
 
-    /// Refuse an operation that restic runs under an exclusive lock while restic holds any
-    /// lock, unless `--ignore-restic-locks` is set.
+    /// Refuse an operation that restic runs under an exclusive lock while another process
+    /// holds any lock, unless `--ignore-restic-locks` is set. With `--restic-locks`, take an
+    /// exclusive lock for the rest of this repository's lifetime.
     pub(crate) fn guard_exclusive(&self) -> RusticResult<()> {
+        self.lock_exclusive()
+    }
+
+    /// Lock the repository exclusively for the rest of its lifetime, like restic does for
+    /// prune, forget, check, key remove, repair, rewrite with forget and config changes. Call it
+    /// before reading what the operation works on. With `--restic-locks` an exclusive lock
+    /// file is written; otherwise the operation is refused while another process holds any
+    /// lock. Does nothing with `--ignore-restic-locks`.
+    ///
+    /// # Errors
+    ///
+    /// * If another process holds a lock, or the lock cannot be written.
+    pub fn lock_exclusive(&self) -> RusticResult<()> {
         if self.opts.ignore_restic_locks {
             return Ok(());
+        }
+        if let Some(locks) = &self.status.open_status().restic_locks {
+            return locks.exclusive();
         }
         self.check_restic_locks(true)
     }
 
-    /// Check for lock files written by restic before an operation that restic would lock.
+    /// Check for lock files written by restic (or by rustic with `--restic-locks`).
     ///
-    /// rustic does not lock, but restic does, and restic assumes nobody prunes while it holds
-    /// a lock. An `exclusive` operation is refused if any lock which is not stale exists; a
-    /// non-exclusive operation is refused if an exclusive lock exists. As in restic, stale
-    /// locks also refuse until they are removed, empty lock files are ignored, and a lock file
-    /// that cannot be read refuses.
+    /// An `exclusive` operation is refused if any other lock exists; a non-exclusive
+    /// operation is refused if an exclusive lock exists. As in restic, stale locks also refuse
+    /// until they are removed, empty lock files are ignored, and a lock file that cannot be
+    /// read refuses. Locks held by this repository are ignored.
     ///
     /// # Errors
     ///
-    /// * If a blocking restic lock exists, or the lock files cannot be listed or read.
+    /// * If a blocking lock exists, or the lock files cannot be listed or read.
     pub fn check_restic_locks(&self, exclusive: bool) -> RusticResult<()> {
-        let be = self.dbe();
-        let now = jiff::Timestamp::now();
-        for (id, size) in be.list_with_size(FileType::Lock)? {
-            // like restic, skip empty files left by an interrupted upload
-            if size == 0 {
-                continue;
-            }
-            let data = be.read_encrypted_full(FileType::Lock, &id)?;
-            let lock: LockFile = serde_json::from_slice(&data).map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::Repository,
-                    "Could not read lock file `{id}`. Remove it with `restic unlock` if it is stale, or use --ignore-restic-locks.",
-                    err,
-                )
-                .attach_context("id", id.to_string())
-            })?;
-            // like restic, a stale lock still blocks until it is removed by `restic unlock`
-            if !(exclusive || lock.exclusive) {
-                continue;
-            }
-            let stale = if lock.is_stale(now) {
-                " It looks stale (older than 30 minutes); if no restic process is running, remove it with `restic unlock`."
-            } else {
-                ""
-            };
-            return Err(RusticError::new(
-                ErrorKind::Repository,
-                "The repository is locked by restic ({kind} lock {id}, created at {time} by {user}@{host}, PID {pid}). Wait for restic to finish, or use --ignore-restic-locks if you know what you are doing.{stale}",
-            )
-            .attach_context("kind", if lock.exclusive { "exclusive" } else { "non-exclusive" })
-            .attach_context("id", id.to_string())
-            .attach_context("time", lock.time)
-            .attach_context("user", lock.username)
-            .attach_context("host", lock.hostname)
-            .attach_context("pid", lock.pid.to_string())
-            .attach_context("stale", stale));
-        }
-        Ok(())
+        let own = self
+            .status
+            .open_status()
+            .restic_locks
+            .as_ref()
+            .map(ResticLocks::ids)
+            .unwrap_or_default();
+        check_locks(self.dbe(), exclusive, &own)
     }
 
+    /// Remove lock files like `restic unlock`: stale ones, or all of them (also unreadable
+    /// ones) if `all` is set. Locks held by this repository are kept. With `dry_run`, nothing
+    /// is removed. Returns the ids of the lock files removed (or which would be removed).
+    ///
+    /// # Errors
+    ///
+    /// * If the lock files cannot be listed or removed.
+    pub fn unlock(&self, all: bool, dry_run: bool) -> RusticResult<Vec<crate::Id>> {
+        let own = self
+            .status
+            .open_status()
+            .restic_locks
+            .as_ref()
+            .map(ResticLocks::ids)
+            .unwrap_or_default();
+        remove_locks(self.dbe(), all, dry_run, &own)
+    }
     pub(crate) fn cache(&self) -> Option<&Cache> {
         self.status.open_status().cache.as_ref()
     }
