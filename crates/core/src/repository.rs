@@ -718,6 +718,15 @@ impl<S: Open> Repository<S> {
         commands::cat::cat_file(self, tpe, id)
     }
 
+    /// Get the contents of a file as stored, without decryption (key files, pack files).
+    ///
+    /// # Errors
+    ///
+    /// * If the id is invalid, not found or not unique, or the file cannot be read.
+    pub fn cat_file_raw(&self, tpe: FileType, id: &str) -> RusticResult<Bytes> {
+        commands::cat::cat_file_raw(self, tpe, id)
+    }
+
     /// Add a new key to the repository
     ///
     /// # Arguments
@@ -1866,6 +1875,15 @@ impl<S: IndexedFull> Repository<S> {
     /// The raw blob in bytes.
     pub fn cat_blob(&self, tpe: BlobType, id: &str) -> RusticResult<Bytes> {
         commands::cat::cat_blob(self, tpe, id)
+    }
+
+    /// Get the decrypted contents of a data or tree blob, whichever has this id.
+    ///
+    /// # Errors
+    ///
+    /// * If the id is invalid or no blob with this id is in the index.
+    pub fn cat_blob_any(&self, id: &str) -> RusticResult<Bytes> {
+        commands::cat::cat_blob_any(self, id)
     }
 
     /// Dump a [`Node`] using the given writer.
