@@ -177,13 +177,11 @@ impl Summary {
     ///
     /// * `node` - the node to update the summary with
     pub fn update(&mut self, node: &Node) {
+        // like restic: only regular files count as files (symlinks, devices etc. do not)
         if node.is_dir() {
             self.dirs += 1;
-        } else {
+        } else if node.is_file() {
             self.files += 1;
-        }
-
-        if node.is_file() {
             self.size += node.meta.size;
         }
     }

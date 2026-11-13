@@ -79,7 +79,14 @@ pub(crate) fn rewrite_snapshots_and_trees<S: IndexedFull>(
                 snap_summary.total_files_processed = summary.files;
                 snap_summary.total_bytes_processed = summary.size;
                 snap_summary.total_dirs_processed = summary.dirs;
-                changed |= sn.summary.is_none_or(|sum| sum != snap_summary);
+                // like restic, only the processed files and bytes decide; the dir count is
+                // compared only when the old summary has one (restic does not write it)
+                changed |= sn.summary.as_ref().is_none_or(|sum| {
+                    sum.total_files_processed != snap_summary.total_files_processed
+                        || sum.total_bytes_processed != snap_summary.total_bytes_processed
+                        || (sum.total_dirs_processed != 0
+                            && sum.total_dirs_processed != snap_summary.total_dirs_processed)
+                });
                 sn.summary = Some(snap_summary);
             }
 

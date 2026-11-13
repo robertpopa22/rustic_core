@@ -25,13 +25,13 @@ pub struct SnapshotModification {
     pub set_label: Option<String>,
 
     /// Set the backup time (e.g. "2021-01-21 14:15:23")
-    #[cfg_attr(feature = "clap", clap(long, value_parser = crate::repofile::RusticTime::parse_system))]
+    #[cfg_attr(feature = "clap", clap(long, alias = "new-time", value_parser = crate::repofile::RusticTime::parse_system))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     #[serde_as(as = "Option<RusticTime>")]
     pub set_time: Option<Zoned>,
 
     /// Set the host name
-    #[cfg_attr(feature = "clap", clap(long, value_name = "NAME"))]
+    #[cfg_attr(feature = "clap", clap(long, alias = "new-host", value_name = "NAME"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub set_hostname: Option<String>,
 
